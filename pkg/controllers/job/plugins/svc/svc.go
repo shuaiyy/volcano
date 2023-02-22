@@ -162,12 +162,26 @@ func (sp *servicePlugin) OnJobDelete(job *batch.Job) error {
 		return err
 	}
 
-	if err := sp.Clientset.KubeClients.CoreV1().Services(job.Namespace).Delete(context.TODO(), job.Name, metav1.DeleteOptions{}); err != nil {
-		if !apierrors.IsNotFound(err) {
-			klog.Errorf("Failed to delete Service of Job %v/%v: %v", job.Namespace, job.Name, err)
-			return err
+	svcList := []*v1.Service{
+		{ // job service
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: job.Namespace,
+				Name:      job.Name,
+			},
+		},
+	}
+	if sp.createServiceForEveryPod {
+		svcList = append(svcList, generatePodServices(job, sp.publishNotReadyAddresses)...)
+	}
+	for _, svc := range svcList {
+		if err := sp.Clientset.KubeClients.CoreV1().Services(job.Namespace).Delete(context.TODO(), svc.Name, metav1.DeleteOptions{}); err != nil {
+			if !apierrors.IsNotFound(err) {
+				klog.Errorf("Failed to delete Service<%s> of Job %v/%v: %v", svc.Name, job.Namespace, job.Name, err)
+				return err
+			}
 		}
 	}
+
 	delete(job.Status.ControlledResources, "plugin-"+sp.Name())
 
 	if !sp.disableNetworkPolicy {
