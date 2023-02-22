@@ -44,6 +44,7 @@ type servicePlugin struct {
 	// flag parse args
 	publishNotReadyAddresses bool
 	disableNetworkPolicy     bool
+	createServiceForEveryPod bool
 }
 
 // New creates service plugin.
@@ -65,6 +66,8 @@ func (sp *servicePlugin) addFlags() {
 		"set publishNotReadyAddresses of svc to true")
 	flagSet.BoolVar(&sp.disableNetworkPolicy, "disable-network-policy", sp.disableNetworkPolicy,
 		"set disableNetworkPolicy of svc to true")
+	flagSet.BoolVar(&sp.createServiceForEveryPod, "create-service-for-every-pod", sp.createServiceForEveryPod,
+		"set createServiceForEveryPod of svc to true")
 
 	if err := flagSet.Parse(sp.pluginArguments); err != nil {
 		klog.Errorf("plugin %s flagset parse failed, err: %v", sp.Name(), err)
@@ -212,14 +215,8 @@ func (sp *servicePlugin) mountConfigmap(pod *v1.Pod, job *batch.Job) {
 
 func (sp *servicePlugin) createServiceIfNotExist(job *batch.Job) error {
 	// If Service does not exist, create one for Job.
-	if _, err := sp.Clientset.KubeClients.CoreV1().Services(job.Namespace).Get(context.TODO(), job.Name, metav1.GetOptions{}); err != nil {
-		if !apierrors.IsNotFound(err) {
-			klog.V(3).Infof("Failed to get Service for Job <%s/%s>: %v",
-				job.Namespace, job.Name, err)
-			return err
-		}
-
-		svc := &v1.Service{
+	svcList := []*v1.Service{
+		{ // job service
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: job.Namespace,
 				Name:      job.Name,
@@ -235,15 +232,25 @@ func (sp *servicePlugin) createServiceIfNotExist(job *batch.Job) error {
 				},
 				PublishNotReadyAddresses: sp.publishNotReadyAddresses,
 			},
-		}
-
-		if _, e := sp.Clientset.KubeClients.CoreV1().Services(job.Namespace).Create(context.TODO(), svc, metav1.CreateOptions{}); e != nil {
-			klog.V(3).Infof("Failed to create Service for Job <%s/%s>: %v", job.Namespace, job.Name, e)
-			return e
-		}
-		job.Status.ControlledResources["plugin-"+sp.Name()] = sp.Name()
+		},
 	}
-
+	if sp.createServiceForEveryPod {
+		svcList = append(svcList, generatePodServices(job, sp.publishNotReadyAddresses)...)
+	}
+	for _, v := range svcList {
+		svc := v
+		if _, err := sp.Clientset.KubeClients.CoreV1().Services(svc.Namespace).Get(context.TODO(), svc.Name, metav1.GetOptions{}); err != nil {
+			if !apierrors.IsNotFound(err) {
+				klog.V(3).Infof("Failed to get Service<%s> for Job <%s/%s>: %v", svc.Name, job.Namespace, job.Name, err)
+				return err
+			}
+			if _, e := sp.Clientset.KubeClients.CoreV1().Services(svc.Namespace).Create(context.TODO(), svc, metav1.CreateOptions{}); e != nil {
+				klog.V(3).Infof("Failed to create Service<%s> for Job <%s/%s>: %v", svc.Name, job.Namespace, job.Name, e)
+				return e
+			}
+		}
+	}
+	job.Status.ControlledResources["plugin-"+sp.Name()] = sp.Name()
 	return nil
 }
 
@@ -336,4 +343,38 @@ func GenerateHosts(job *batch.Job) map[string]string {
 	}
 
 	return hostFile
+}
+
+func generatePodServices(job *batch.Job, publishNotReadyAddresses bool) []*v1.Service {
+	serviceMap := make(map[string]string)
+	for k, v := range GenerateHosts(job) {
+		// VC_%s_HOSTS: "pod_name.job_name,..."
+		if !strings.Contains(k, "HOSTS") {
+			continue
+		}
+		hosts := strings.Split(v, ",")
+		for _, host := range hosts {
+			serviceMap[strings.Replace(host, ".", "-", -1)] = fmt.Sprintf("%s.%s", host, job.Namespace)
+		}
+	}
+
+	var services []*v1.Service
+	for name, host := range serviceMap {
+		services = append(services, &v1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: job.Namespace,
+				OwnerReferences: []metav1.OwnerReference{
+					*metav1.NewControllerRef(job, helpers.JobKind),
+				},
+			},
+			Spec: v1.ServiceSpec{
+				Type:                     v1.ServiceTypeExternalName,
+				ExternalName:             host,
+				PublishNotReadyAddresses: publishNotReadyAddresses,
+			},
+		})
+
+	}
+	return services
 }
