@@ -354,7 +354,9 @@ func generatePodServices(job *batch.Job, publishNotReadyAddresses bool) []*v1.Se
 		}
 		hosts := strings.Split(v, ",")
 		for _, host := range hosts {
-			serviceMap[strings.Replace(host, ".", "-", -1)] = fmt.Sprintf("%s.%s", host, job.Namespace)
+			svcName := strings.Split(host, ".")[0]
+			host := fmt.Sprintf("%s.%s", host, job.Namespace)
+			serviceMap[svcName] = host
 		}
 	}
 
